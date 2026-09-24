@@ -1,0 +1,29 @@
+on:
+  workflow_call:
+    inputs:
+      payload: { type: string, required: true }
+permissions:
+  issues: write
+jobs:
+  issue:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      P: ${{ inputs.payload }}
+    steps:
+      - run: |
+          T=$(jq -r '.template' <<< "$P")
+          E=$(jq -r '.exception // ""' <<< "$P")
+          URL=$(jq -r '.seqUrl // ""' <<< "$P")
+          FP=$(printf '%s|%s' "$T" "$E" | sha1sum | cut -c1-8)
+          gh label create seq-error --color B60205 2>/dev/null || true
+          N=$(gh issue list --label seq-error --state open \
+                --search "$FP in:title" --json number -q '.[0].number')
+          BODY=$(printf '**Fejl:** %s\n\n**Exception:** %s\n\n[Åbn i Seq](%s)' "$T" "$E" "$URL")
+          if [ -n "$N" ]; then
+            gh issue comment "$N" --body "Fejlen er set igen. $URL"
+          else
+            gh issue create --label seq-error \
+              --title "[$FP] ${T:0:80}" --body "$BODY"
+          fi
