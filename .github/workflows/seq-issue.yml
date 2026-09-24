@@ -13,17 +13,33 @@ jobs:
       P: ${{ inputs.payload }}
     steps:
       - run: |
-          T=$(jq -r '.template' <<< "$P")
-          E=$(jq -r '.exception // ""' <<< "$P")
+          T=$(jq -r '.template // "Ukendt fejl"' <<< "$P")
+          M=$(jq -r '.message // ""' <<< "$P")
+          X=$(jq -r '.exception // ""' <<< "$P")
+          APP=$(jq -r '.app // ""' <<< "$P")
           URL=$(jq -r '.seqUrl // ""' <<< "$P")
-          FP=$(printf '%s|%s' "$T" "$E" | sha1sum | cut -c1-8)
+          # Fingerprint på template + første linje af exception (typen), ikke hele stacktracen
+          FP=$(printf '%s|%s' "$T" "$(head -n1 <<< "$X")" | sha1sum | cut -c1-8)
           gh label create seq-error --color B60205 2>/dev/null || true
           N=$(gh issue list --label seq-error --state open \
                 --search "$FP in:title" --json number -q '.[0].number')
-          BODY=$(printf '**Fejl:** %s\n\n**Exception:** %s\n\n[Åbn i Seq](%s)' "$T" "$E" "$URL")
+          {
+            echo "**App:** $APP"
+            echo
+            echo "**Besked:** $M"
+            echo
+            echo "**Template:** \`$T\`"
+            echo
+            echo "**Stacktrace:**"
+            echo '```'
+            printf '%s\n' "${X:0:60000}"
+            echo '```'
+            echo
+            echo "[Åbn i Seq]($URL)"
+          } > body.md
           if [ -n "$N" ]; then
-            gh issue comment "$N" --body "Fejlen er set igen. $URL"
+            gh issue comment "$N" --body-file body.md
           else
             gh issue create --label seq-error \
-              --title "[$FP] ${T:0:80}" --body "$BODY"
+              --title "[$FP] $APP: ${T:0:80}" --body-file body.md
           fi
