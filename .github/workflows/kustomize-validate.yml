@@ -1,0 +1,29 @@
+name: Kustomize validate
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: Kustomization directories to render, separated by whitespace
+        type: string
+        required: true
+
+jobs:
+  validate:
+    name: Render manifests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render manifests
+        env:
+          KUSTOMIZE_PATHS: ${{ inputs.paths }}
+        run: |
+          set -euo pipefail
+          for path in $KUSTOMIZE_PATHS; do
+            echo "::group::$path"
+            kubectl kustomize "$path"
+            echo "::endgroup::"
+          done
