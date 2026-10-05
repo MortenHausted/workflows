@@ -1,0 +1,149 @@
+name: Argo CD sync
+
+# Creates or updates an Argo CD application, optionally points it at new image
+# tags, then syncs it and waits until it is healthy.
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: Argo CD application name
+        type: string
+        required: true
+      manifest:
+        description: Path to the Application manifest. When set, the application is created or updated from it.
+        type: string
+        default: ''
+      images:
+        description: Image repositories (without tag) to point at the new tag, separated by whitespace
+        type: string
+        default: ''
+      tag:
+        description: Image tag to deploy. Defaults to sha-<commit>.
+        type: string
+        default: ''
+      timeout:
+        description: Seconds to wait for the sync and for the application to become healthy
+        type: number
+        default: 600
+    secrets:
+      argocd-url:
+        required: true
+      argocd-token:
+        required: true
+
+jobs:
+  sync:
+    name: Sync ${{ inputs.app }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: argocd-${{ inputs.app }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Argo CD CLI
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/argocd" https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          sudo install -m 555 "$RUNNER_TEMP/argocd" /usr/local/bin/argocd
+
+      - name: Sync
+        env:
+          APP: ${{ inputs.app }}
+          MANIFEST: ${{ inputs.manifest }}
+          IMAGES: ${{ inputs.images }}
+          TAG: ${{ inputs.tag }}
+          TIMEOUT: ${{ inputs.timeout }}
+          ARGOCD_URL: ${{ secrets.argocd-url }}
+          ARGOCD_TOKEN: ${{ secrets.argocd-token }}
+        run: |
+          set -euo pipefail
+
+          host="${ARGOCD_URL#https://}"
+          host="${host#http://}"
+          host="${host%/}"
+          root=""
+          if [[ "$host" == */* ]]; then
+            root="/${host#*/}"
+            host="${host%%/*}"
+          fi
+          export ARGOCD_SERVER="$host"
+          export ARGOCD_AUTH_TOKEN="$ARGOCD_TOKEN"
+          export ARGOCD_OPTS="--grpc-web${root:+ --grpc-web-root-path $root}"
+
+          tag="${TAG:-sha-$GITHUB_SHA}"
+
+          retry() {
+            local n
+            for n in 1 2 3; do
+              "$@" && return 0
+              echo "Attempt $n failed: $*" >&2
+              sleep $((n * 5))
+            done
+            return 1
+          }
+
+          # Syncs and waits until healthy. Only retries when another sync (e.g. auto-sync)
+          # is already running; any other failure fails immediately.
+          sync_app() {
+            local n out
+            out=$(mktemp)
+            for n in 1 2 3; do
+              echo "Syncing $APP..."
+              argocd app wait "$APP" --operation --timeout "$TIMEOUT" >/dev/null || true
+              if argocd app sync "$APP" --timeout "$TIMEOUT" 2>&1 | tee "$out"; then
+                echo "Waiting for $APP to be healthy..."
+                argocd app wait "$APP" --health --timeout "$TIMEOUT"
+                return
+              fi
+              grep -q "another operation is already in progress" "$out" || return 1
+              echo "Another sync of $APP is running, retrying ($n/3)" >&2
+              sleep 5
+            done
+            return 1
+          }
+
+          argocd account get-user-info >/dev/null
+
+          if [[ -n "$MANIFEST" ]]; then
+            name=$(yq '.metadata.name' "$MANIFEST")
+            if [[ "$name" != "$APP" ]]; then
+              echo "::error::$MANIFEST defines '$name', expected '$APP'"
+              exit 1
+            fi
+            # Keep the image tags set by earlier deploys, otherwise the upsert would roll them back.
+            existing=$(argocd app get "$APP" -o json 2>/dev/null | jq -c '.spec.source.kustomize.images // []' || echo '[]')
+            if [[ -z "$existing" || "$existing" == "[]" ]]; then
+              cp "$MANIFEST" "$RUNNER_TEMP/app.yaml"
+            else
+              EXISTING="$existing" yq '.spec.source.kustomize.images = env(EXISTING)' "$MANIFEST" >"$RUNNER_TEMP/app.yaml"
+            fi
+            retry argocd app create --upsert -f "$RUNNER_TEMP/app.yaml"
+          fi
+
+          read -ra images <<<"$(tr '\n' ' ' <<<"$IMAGES")"
+          if ((${#images[@]})); then
+            json=$(retry argocd app get "$APP" -o json)
+            current=$(jq -r --arg img "${images[0]}" \
+              '[(.spec.source.kustomize.images // [])[] | select(startswith($img + ":")) | ltrimstr($img + ":")][0] // ""' <<<"$json")
+
+            # A slower, older build must not roll back a newer one that already deployed.
+            if [[ "$current" == sha-* && "$current" != "$tag" ]] &&
+              git merge-base --is-ancestor "${tag#sha-}" "${current#sha-}" 2>/dev/null; then
+              echo "Skipping: $current is newer than $tag"
+              exit 0
+            fi
+
+            args=()
+            for image in "${images[@]}"; do
+              args+=(--kustomize-image "$image:$tag")
+            done
+            echo "Deploying tag $tag to $APP (was: ${current:-unset})"
+            retry argocd app set "$APP" "${args[@]}"
+          fi
+
+          sync_app
