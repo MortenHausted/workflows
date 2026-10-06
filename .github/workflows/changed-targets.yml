@@ -1,0 +1,114 @@
+name: Changed targets
+
+# Works out which targets (e.g. images) are affected by the files changed in a
+# push or pull request, so that only those are built.
+#
+# `targets` maps a name to an object with `paths` (path prefixes that affect the
+# target) and any extra fields, which are passed through to the matrix output:
+#
+#   {"api": {"paths": ["src/api/", "src/shared/"], "dockerfile": "src/api/Dockerfile"}}
+#
+# Every target counts as changed when a file under `all-on` changed, when
+# `force-all` is set, or when there is nothing to compare against (manual runs,
+# new branches and tags).
+
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: JSON object mapping target name to {paths, ...extra fields}
+        type: string
+        required: true
+      all-on:
+        description: Path prefixes that affect every target, separated by whitespace
+        type: string
+        default: ''
+      prefix:
+        description: Prefix put in front of each name in the list output
+        type: string
+        default: ''
+      force-all:
+        description: Treat every target as changed
+        type: boolean
+        default: false
+    outputs:
+      matrix:
+        description: JSON array with one object per changed target (name plus its extra fields)
+        value: ${{ jobs.detect.outputs.matrix }}
+      list:
+        description: Changed target names with the prefix applied, separated by spaces
+        value: ${{ jobs.detect.outputs.list }}
+      any:
+        description: "'true' when at least one target changed"
+        value: ${{ jobs.detect.outputs.any }}
+
+jobs:
+  detect:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      list: ${{ steps.detect.outputs.list }}
+      any: ${{ steps.detect.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: detect
+        env:
+          TARGETS: ${{ inputs.targets }}
+          ALL_ON: ${{ inputs.all-on }}
+          PREFIX: ${{ inputs.prefix }}
+          FORCE_ALL: ${{ inputs.force-all }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          base=""
+          case "$EVENT" in
+            pull_request | pull_request_target) base="$PR_BASE" ;;
+            push) base="$BEFORE" ;;
+          esac
+
+          all=false
+          files="[]"
+          if [[ "$FORCE_ALL" == "true" ]]; then
+            echo "force-all is set: every target counts as changed"
+            all=true
+          elif [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "Nothing to compare against: every target counts as changed"
+            all=true
+          else
+            echo "Comparing $base with $(git rev-parse HEAD)"
+            files=$(git diff --name-only "$base" HEAD | jq -R . | jq -sc .)
+            jq -r '.[]' <<<"$files"
+          fi
+
+          result=$(jq -c -n \
+            --argjson targets "$TARGETS" \
+            --argjson files "$files" \
+            --argjson all "$all" \
+            --arg allOn "$ALL_ON" \
+            --arg prefix "$PREFIX" '
+            def hit($paths): any($files[]; . as $f | any($paths[]; . as $p | $f | startswith($p)));
+            ($allOn | split("[[:space:]]+"; null) | map(select(length > 0))) as $allPaths
+            | ($all or hit($allPaths)) as $everything
+            | [ $targets | to_entries[]
+                | select($everything or hit(.value.paths // []))
+                | {name: .key} + (.value | del(.paths)) ] as $matrix
+            | { matrix: $matrix,
+                list: ($matrix | map($prefix + .name) | join(" ")),
+                any: ($matrix | length > 0) }')
+
+          {
+            echo "matrix=$(jq -c .matrix <<<"$result")"
+            echo "list=$(jq -r .list <<<"$result")"
+            echo "any=$(jq -r .any <<<"$result")"
+          } >>"$GITHUB_OUTPUT"
+
+          echo "Changed targets: $(jq -r '.matrix | map(.name) | join(", ") | if . == "" then "none" else . end' <<<"$result")"
